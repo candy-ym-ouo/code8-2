@@ -1,11 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ApiError } from '../api/client';
-import { booksApi, reflectionApi, traceApi } from '../api';
+import { booksApi, reflectionApi, timelineApi, traceApi } from '../api';
 import { formatDate, formatDateTime } from '../api/format';
 import ErrorNotice from '../components/ErrorNotice.vue';
 import MoodPicker from '../components/MoodPicker.vue';
+import {
+  groupTracesByPage,
+  locatePageGroup,
+  neighborLocation,
+  summarizeTraces,
+  type PageLocation,
+  type TraceFilter
+} from '../utils/traceNavigation';
 import {
   ACTION_LABELS,
   ENTITY_LABELS,
@@ -19,10 +27,11 @@ import {
   type Trace,
   type TraceType
 } from '../types/domain';
-import { timelineApi } from '../api';
 
 type DeletedItem = { kind: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK' | 'REFLECTION'; id: string; label: string };
 type ReflectionEdit = { id: string; version: number; moodTags: MoodTag[]; text: string };
+
+const PAGE_GROUP_BATCH = 15;
 
 const route = useRoute();
 const router = useRouter();
@@ -36,7 +45,13 @@ const loading = ref(true);
 const saving = ref(false);
 const error = ref('');
 const success = ref('');
-const activeTab = ref<'PAGES' | TraceType | 'REFLECTIONS' | 'TIMELINE'>('PAGES');
+const activeTab = ref<'TRACES' | 'REFLECTIONS' | 'TIMELINE'>('TRACES');
+const traceFilter = ref<TraceFilter>('ALL');
+const renderLimit = ref(PAGE_GROUP_BATCH);
+const jumpInput = ref('');
+const locatedPage = ref<number | null>(null);
+const jumpHint = ref('');
+const traceListEl = ref<HTMLElement | null>(null);
 const createType = ref<TraceType | null>(null);
 const editing = ref<Trace | null>(null);
 const showCompleteForm = ref(false);
@@ -55,17 +70,41 @@ const completeForm = reactive({
 });
 
 const tabs = computed(() => [
-  { value: 'PAGES' as const, label: '按页' },
-  { value: 'DOG_EAR' as const, label: `折角 ${book.value?.traceSummary.dogEars ?? 0}` },
-  { value: 'ANNOTATION' as const, label: `批注 ${book.value?.traceSummary.annotations ?? 0}` },
-  { value: 'REREAD_MARK' as const, label: `重读 ${book.value?.traceSummary.rereadMarks ?? 0}` },
+  { value: 'TRACES' as const, label: `痕迹 ${traceDigest.value.total}` },
   { value: 'REFLECTIONS' as const, label: `读完感受 ${reflections.value.length}` },
   { value: 'TIMELINE' as const, label: '本书时间线' }
 ]);
 
-const visibleTraces = computed(() => {
-  const filtered = activeTab.value === 'PAGES' ? traces.value : traces.value.filter((trace) => trace.type === activeTab.value);
-  return [...filtered].sort((a, b) => tracePage(a) - tracePage(b) || b.createdAt.localeCompare(a.createdAt));
+const traceDigest = computed(() => summarizeTraces(traces.value));
+
+const digestOptions = computed(() => [
+  { value: 'ALL' as TraceFilter, label: `全部 ${traceDigest.value.total}` },
+  { value: 'DOG_EAR' as TraceFilter, label: `折角 ${traceDigest.value.dogEars}` },
+  { value: 'ANNOTATION' as TraceFilter, label: `批注 ${traceDigest.value.annotations}` },
+  { value: 'REREAD_MARK' as TraceFilter, label: `重读 ${traceDigest.value.rereadMarks}` }
+]);
+
+const pageGroups = computed(() => groupTracesByPage(traces.value, traceFilter.value));
+
+const visibleGroups = computed(() => pageGroups.value.slice(0, renderLimit.value));
+
+const hiddenGroupCount = computed(() => Math.max(0, pageGroups.value.length - visibleGroups.value.length));
+
+const locatedIndex = computed(() => pageGroups.value.findIndex((group) => group.page === locatedPage.value));
+const canStepPrev = computed(() => locatedIndex.value > 0);
+const canStepNext = computed(() => locatedIndex.value !== -1 && locatedIndex.value < pageGroups.value.length - 1);
+
+const emptyTraceMessage = computed(() =>
+  traceFilter.value === 'ALL'
+    ? '这本书还没有留下阅读痕迹。'
+    : `还没有${TRACE_LABELS[traceFilter.value]}痕迹，换个分类看看。`
+);
+
+watch(pageGroups, (groups) => {
+  if (locatedPage.value !== null && !groups.some((group) => group.page === locatedPage.value)) {
+    jumpHint.value = `第 ${locatedPage.value} 页的痕迹已变化，定位已取消`;
+    locatedPage.value = null;
+  }
 });
 
 const statusActions = computed(() => {
@@ -82,10 +121,6 @@ const statusActions = computed(() => {
   }
   return actions;
 });
-
-function tracePage(trace: Trace): number {
-  return trace.type === 'ANNOTATION' ? trace.startPage : trace.pageNumber;
-}
 
 function traceRange(trace: Trace): string {
   if (trace.type === 'ANNOTATION') {
@@ -137,6 +172,61 @@ async function load(): Promise<void> {
   }
 }
 
+function setTraceFilter(filter: TraceFilter): void {
+  traceFilter.value = filter;
+  locatedPage.value = null;
+  jumpHint.value = '';
+  renderLimit.value = PAGE_GROUP_BATCH;
+}
+
+function showMoreGroups(): void {
+  renderLimit.value += PAGE_GROUP_BATCH;
+}
+
+function scrollToLocatedGroup(page: number): void {
+  const target = traceListEl.value?.querySelector(`[data-page-group="${page}"]`);
+  if (target instanceof HTMLElement) {
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+function applyLocation(location: PageLocation): void {
+  locatedPage.value = location.page;
+  jumpInput.value = String(location.page);
+  if (renderLimit.value < location.index + 1) {
+    renderLimit.value = location.index + 1;
+  }
+  void nextTick(() => scrollToLocatedGroup(location.page));
+}
+
+function jumpToPage(targetPage: number): void {
+  if (!Number.isInteger(targetPage) || targetPage < 1) {
+    jumpHint.value = '请输入 1 以上的整数页码';
+    return;
+  }
+  const location = locatePageGroup(pageGroups.value, targetPage);
+  if (!location) {
+    jumpHint.value = '当前过滤下还没有任何痕迹可定位';
+    return;
+  }
+  applyLocation(location);
+  jumpHint.value = location.exact
+    ? `已定位到第 ${location.page} 页`
+    : `第 ${targetPage} 页没有痕迹，已定位到最近的第 ${location.page} 页`;
+}
+
+function submitJump(): void {
+  jumpToPage(Number(jumpInput.value));
+}
+
+function stepPage(direction: -1 | 1): void {
+  if (locatedPage.value === null) return;
+  const location = neighborLocation(pageGroups.value, locatedPage.value, direction);
+  if (!location) return;
+  applyLocation(location);
+  jumpHint.value = `已定位到第 ${location.page} 页`;
+}
+
 function resetTraceForm(): void {
   traceForm.pageNumber = '';
   traceForm.reason = '';
@@ -172,6 +262,13 @@ async function submitTrace(): Promise<void> {
   if (!editing.value && !createType.value) return;
   saving.value = true;
   error.value = '';
+  const createdType = createType.value;
+  const createdPage =
+    createdType === 'DOG_EAR' || createdType === 'REREAD_MARK'
+      ? Number(traceForm.pageNumber)
+      : createdType === 'ANNOTATION'
+        ? Number(traceForm.startPage)
+        : null;
   try {
     if (createType.value === 'DOG_EAR') {
       await traceApi.createDogEar(book.value.id, {
@@ -213,6 +310,10 @@ async function submitTrace(): Promise<void> {
     editing.value = null;
     success.value = '阅读痕迹已保存';
     await load();
+    if (createdType && createdPage !== null) {
+      if (traceFilter.value !== 'ALL' && traceFilter.value !== createdType) setTraceFilter('ALL');
+      jumpToPage(createdPage);
+    }
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '保存失败，请检查输入';
   } finally {
@@ -240,13 +341,18 @@ async function restoreLastDeleted(): Promise<void> {
   error.value = '';
   try {
     const item = lastDeleted.value;
-    if (item.kind === 'DOG_EAR') await traceApi.restoreDogEar(item.id);
-    if (item.kind === 'ANNOTATION') await traceApi.restoreAnnotation(item.id);
-    if (item.kind === 'REREAD_MARK') await traceApi.restoreReread(item.id);
+    let restoredPage: number | null = null;
+    if (item.kind === 'DOG_EAR') restoredPage = (await traceApi.restoreDogEar(item.id)).dogEar.pageNumber;
+    if (item.kind === 'ANNOTATION') restoredPage = (await traceApi.restoreAnnotation(item.id)).annotation.startPage;
+    if (item.kind === 'REREAD_MARK') restoredPage = (await traceApi.restoreReread(item.id)).rereadMark.pageNumber;
     if (item.kind === 'REFLECTION') await reflectionApi.restore(item.id);
     lastDeleted.value = null;
     success.value = '删除已撤销';
     await load();
+    if (restoredPage !== null) {
+      if (traceFilter.value !== 'ALL' && traceFilter.value !== item.kind) setTraceFilter('ALL');
+      jumpToPage(restoredPage);
+    }
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '恢复失败';
   }
@@ -532,22 +638,71 @@ onMounted(load);
         <p v-if="activities.length === 0" class="empty-inline">这本书还没有变化记录。</p>
       </div>
 
-      <div v-else class="trace-list">
-        <article v-for="trace in visibleTraces" :key="`${trace.type}-${trace.id}`" class="trace-card">
-          <div class="trace-card-heading">
-            <div>
-              <span class="trace-type">{{ TRACE_LABELS[trace.type] }}</span>
-              <strong>{{ traceRange(trace) }}</strong>
-            </div>
-            <div class="button-row">
-              <button class="text-button" type="button" @click="openEdit(trace)">编辑</button>
-              <button class="text-button danger-text" type="button" @click="deleteTrace(trace)">删除</button>
-            </div>
+      <div v-else class="trace-view">
+        <div class="trace-toolbar">
+          <div class="trace-digest" role="group" aria-label="按类型过滤痕迹">
+            <button
+              v-for="option in digestOptions"
+              :key="option.value"
+              class="digest-chip"
+              :class="{ active: traceFilter === option.value }"
+              type="button"
+              :aria-pressed="traceFilter === option.value"
+              @click="setTraceFilter(option.value)"
+            >
+              {{ option.label }}
+            </button>
+            <span class="digest-pages">覆盖 {{ traceDigest.pages }} 页</span>
           </div>
-          <p class="preserve-text">{{ traceBody(trace) }}</p>
-          <p class="muted">创建 {{ formatDateTime(trace.createdAt) }} · 更新 {{ formatDateTime(trace.updatedAt) }}</p>
-        </article>
-        <p v-if="visibleTraces.length === 0" class="empty-inline">这个分类还没有留下痕迹。</p>
+          <form class="trace-jump" @submit.prevent="submitJump">
+            <label class="trace-jump-field">
+              跳到第
+              <input v-model="jumpInput" type="number" min="1" step="1" inputmode="numeric" placeholder="页码" aria-label="目标页码" />
+              页
+            </label>
+            <button class="button" type="submit">定位</button>
+            <button class="button button-quiet" type="button" :disabled="!canStepPrev" @click="stepPage(-1)">上一页</button>
+            <button class="button button-quiet" type="button" :disabled="!canStepNext" @click="stepPage(1)">下一页</button>
+          </form>
+          <p v-if="jumpHint" class="jump-hint" role="status">{{ jumpHint }}</p>
+        </div>
+
+        <div ref="traceListEl" class="trace-groups">
+          <section
+            v-for="group in visibleGroups"
+            :key="group.page"
+            class="page-group"
+            :class="{ located: group.page === locatedPage }"
+            :data-page-group="group.page"
+          >
+            <header class="page-group-heading">
+              <h3>第 {{ group.page }} 页</h3>
+              <span class="muted">{{ group.items.length }} 条痕迹</span>
+            </header>
+            <div class="page-group-items">
+              <article v-for="trace in group.items" :key="`${trace.type}-${trace.id}`" class="trace-card">
+                <div class="trace-card-heading">
+                  <div>
+                    <span class="trace-type">{{ TRACE_LABELS[trace.type] }}</span>
+                    <strong>{{ traceRange(trace) }}</strong>
+                  </div>
+                  <div class="button-row">
+                    <button class="text-button" type="button" @click="openEdit(trace)">编辑</button>
+                    <button class="text-button danger-text" type="button" @click="deleteTrace(trace)">删除</button>
+                  </div>
+                </div>
+                <p class="preserve-text">{{ traceBody(trace) }}</p>
+                <p class="muted">创建 {{ formatDateTime(trace.createdAt) }} · 更新 {{ formatDateTime(trace.updatedAt) }}</p>
+              </article>
+            </div>
+          </section>
+          <p v-if="pageGroups.length === 0" class="empty-inline">{{ emptyTraceMessage }}</p>
+        </div>
+        <div v-if="hiddenGroupCount > 0" class="show-more-row">
+          <button class="button button-quiet" type="button" @click="showMoreGroups">
+            显示更多（还有 {{ hiddenGroupCount }} 页）
+          </button>
+        </div>
       </div>
     </section>
   </section>

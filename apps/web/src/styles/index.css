@@ -692,6 +692,130 @@ small,
   gap: 0.8rem;
 }
 
+.trace-view {
+  display: grid;
+  gap: 1rem;
+}
+
+.trace-toolbar {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.trace-digest {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.digest-chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fffefb;
+  color: var(--muted);
+  font-weight: 700;
+  padding: 0.35rem 0.85rem;
+  cursor: pointer;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.digest-chip:hover {
+  border-color: var(--accent);
+}
+
+.digest-chip.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fffaf4;
+}
+
+.digest-pages {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.trace-jump {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.trace-jump-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: #51483e;
+  font-size: 0.94rem;
+  font-weight: 700;
+}
+
+.trace-jump-field input {
+  width: 110px;
+  padding: 0.5rem 0.65rem;
+}
+
+.jump-hint {
+  margin: 0;
+  color: var(--accent-dark);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.trace-groups {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.page-group {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fffefb;
+  padding: 1rem;
+  scroll-margin-top: 96px;
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.page-group.located {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgb(141 75 52 / 16%);
+}
+
+.page-group-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px dashed var(--line);
+  margin-bottom: 0.4rem;
+  padding-bottom: 0.45rem;
+}
+
+.page-group-heading h3 {
+  margin: 0;
+}
+
+.page-group-items {
+  display: grid;
+}
+
+.page-group-items .trace-card {
+  border: 0;
+  border-radius: 0;
+  padding: 0.8rem 0 0.2rem;
+}
+
+.page-group-items .trace-card + .trace-card {
+  border-top: 1px dashed var(--line);
+}
+
+.show-more-row {
+  display: flex;
+  justify-content: center;
+}
+
 .trace-card {
   border: 1px solid var(--line);
   border-radius: 14px;
