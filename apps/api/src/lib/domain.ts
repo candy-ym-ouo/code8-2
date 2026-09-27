@@ -9,6 +9,36 @@ export const STATUS_TRANSITIONS: Record<BookStatus, BookStatus[]> = {
   ABANDONED: []
 };
 
+export const TRACE_SORTS = ['page', 'recent'] as const;
+export type TraceSort = (typeof TRACE_SORTS)[number];
+
+export interface TraceSortable {
+  createdAt: Date;
+  pageNumber?: number;
+  startPage?: number;
+}
+
+/** 痕迹用于“按页”排序与跳页定位的主页码；批注取起始页。 */
+export function tracePrimaryPage(trace: TraceSortable): number {
+  return trace.startPage ?? trace.pageNumber ?? 0;
+}
+
+/**
+ * 按页：主页码升序，同页按创建时间倒序；按时间：创建时间倒序。
+ * 不修改原数组，返回新数组。
+ */
+export function sortTracesBy<T extends TraceSortable>(traces: readonly T[], sort: TraceSort): T[] {
+  const sorted = [...traces];
+  if (sort === 'page') {
+    sorted.sort(
+      (a, b) => tracePrimaryPage(a) - tracePrimaryPage(b) || b.createdAt.getTime() - a.createdAt.getTime()
+    );
+  } else {
+    sorted.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+  return sorted;
+}
+
 export function normalizeText(value: string): string {
   return value.normalize('NFC').trim();
 }

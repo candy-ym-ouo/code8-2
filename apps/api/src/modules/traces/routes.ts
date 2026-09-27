@@ -5,7 +5,7 @@ import { TRACE_TYPES, type TraceType } from '@paper-book-traces/shared';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
-import { isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
+import { isRestoreWindowOpen, normalizeText, sortTracesBy, validatePageRange, validateSinglePage, TRACE_SORTS, type TraceSort } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
 import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
 
@@ -125,6 +125,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (type && !TRACE_TYPES.includes(type as TraceType)) {
       throw new AppError(422, 'VALIDATION_ERROR', '痕迹类型无效');
     }
+    const sortParam = typeof query.sort === 'string' ? query.sort : 'recent';
+    if (!TRACE_SORTS.includes(sortParam as TraceSort)) {
+      throw new AppError(422, 'VALIDATION_ERROR', '排序方式无效');
+    }
+    const sort = sortParam as TraceSort;
     const pageNumber = query.pageNumber === undefined ? undefined : Number(query.pageNumber);
     if (pageNumber !== undefined && (!Number.isInteger(pageNumber) || pageNumber < 1)) {
       throw new AppError(422, 'VALIDATION_ERROR', '页码无效');
@@ -136,57 +141,84 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       ...(from ? { gte: from } : {}),
       ...(to ? { lte: to } : {})
     };
-    const { page, pageSize } = paginationFromQuery(request);
+    const { page, pageSize, skip } = paginationFromQuery(request);
+    const orderByPage = sort === 'page';
 
+    const dogEarWhere: Prisma.DogEarWhereInput = {
+      userId,
+      bookId,
+      deletedAt: null,
+      ...(pageNumber ? { pageNumber } : {}),
+      ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
+      ...(from || to ? { createdAt: dateFilter } : {})
+    };
+    const annotationWhere: Prisma.AnnotationWhereInput = {
+      userId,
+      bookId,
+      deletedAt: null,
+      ...(pageNumber ? { startPage: { lte: pageNumber }, endPage: { gte: pageNumber } } : {}),
+      ...(keyword ? { content: { contains: keyword, mode: 'insensitive' } } : {}),
+      ...(from || to ? { createdAt: dateFilter } : {})
+    };
+    const rereadWhere: Prisma.RereadMarkWhereInput = {
+      userId,
+      bookId,
+      deletedAt: null,
+      ...(pageNumber ? { pageNumber } : {}),
+      ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
+      ...(from || to ? { createdAt: dateFilter } : {})
+    };
+
+    const dogEarOrderBy: Prisma.DogEarOrderByWithRelationInput[] = orderByPage
+      ? [{ pageNumber: 'asc' }, { createdAt: 'desc' }]
+      : [{ createdAt: 'desc' }];
+    const annotationOrderBy: Prisma.AnnotationOrderByWithRelationInput[] = orderByPage
+      ? [{ startPage: 'asc' }, { endPage: 'asc' }, { createdAt: 'desc' }]
+      : [{ createdAt: 'desc' }];
+    const rereadOrderBy: Prisma.RereadMarkOrderByWithRelationInput[] = orderByPage
+      ? [{ pageNumber: 'asc' }, { createdAt: 'desc' }]
+      : [{ createdAt: 'desc' }];
+
+    // 指定类型时在数据库层完成计数与分页，配合页码索引，大量痕迹下也能快速到页。
+    if (type === 'DOG_EAR') {
+      const [total, rows] = await Promise.all([
+        prisma.dogEar.count({ where: dogEarWhere }),
+        prisma.dogEar.findMany({ where: dogEarWhere, orderBy: dogEarOrderBy, skip, take: pageSize })
+      ]);
+      return { items: rows.map(serializeDogEar), pagination: { page, pageSize, total } };
+    }
+    if (type === 'ANNOTATION') {
+      const [total, rows] = await Promise.all([
+        prisma.annotation.count({ where: annotationWhere }),
+        prisma.annotation.findMany({ where: annotationWhere, orderBy: annotationOrderBy, skip, take: pageSize })
+      ]);
+      return { items: rows.map(serializeAnnotation), pagination: { page, pageSize, total } };
+    }
+    if (type === 'REREAD_MARK') {
+      const [total, rows] = await Promise.all([
+        prisma.rereadMark.count({ where: rereadWhere }),
+        prisma.rereadMark.findMany({ where: rereadWhere, orderBy: rereadOrderBy, skip, take: pageSize })
+      ]);
+      return { items: rows.map(serializeRereadMark), pagination: { page, pageSize, total } };
+    }
+
+    // 全类型视图需要合并三类痕迹后再统一排序与分页。
     const [dogEars, annotations, rereadMarks] = await Promise.all([
-      !type || type === 'DOG_EAR'
-        ? prisma.dogEar.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { pageNumber } : {}),
-              ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : [],
-      !type || type === 'ANNOTATION'
-        ? prisma.annotation.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { startPage: { lte: pageNumber }, endPage: { gte: pageNumber } } : {}),
-              ...(keyword ? { content: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : [],
-      !type || type === 'REREAD_MARK'
-        ? prisma.rereadMark.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { pageNumber } : {}),
-              ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : []
+      prisma.dogEar.findMany({ where: dogEarWhere }),
+      prisma.annotation.findMany({ where: annotationWhere }),
+      prisma.rereadMark.findMany({ where: rereadWhere })
     ]);
 
-    const merged = [
-      ...dogEars.map(serializeDogEar),
-      ...annotations.map(serializeAnnotation),
-      ...rereadMarks.map(serializeRereadMark)
-    ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    const merged = sortTracesBy(
+      [
+        ...dogEars.map(serializeDogEar),
+        ...annotations.map(serializeAnnotation),
+        ...rereadMarks.map(serializeRereadMark)
+      ],
+      sort
+    );
     const total = merged.length;
-    const items = merged.slice((page - 1) * pageSize, page * pageSize);
+    const items = merged.slice(skip, skip + pageSize);
     return { items, pagination: { page, pageSize, total } };
   });
 

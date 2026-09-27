@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ApiError } from '../api/client';
-import { booksApi, reflectionApi, traceApi } from '../api';
+import { booksApi, reflectionApi, timelineApi, traceApi } from '../api';
 import { formatDate, formatDateTime } from '../api/format';
 import ErrorNotice from '../components/ErrorNotice.vue';
 import MoodPicker from '../components/MoodPicker.vue';
@@ -19,8 +19,18 @@ import {
   type Trace,
   type TraceType
 } from '../types/domain';
-import { timelineApi } from '../api';
+import {
+  TRACE_PAGE_SIZE,
+  buildTraceQuery,
+  clampListPage,
+  lastListPage,
+  parsePageInput,
+  primaryPageOf,
+  type TraceSortMode,
+  type TraceTab
+} from './trace-view-model';
 
+type DetailTab = TraceTab | 'REFLECTIONS' | 'TIMELINE';
 type DeletedItem = { kind: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK' | 'REFLECTION'; id: string; label: string };
 type ReflectionEdit = { id: string; version: number; moodTags: MoodTag[]; text: string };
 
@@ -33,10 +43,16 @@ const traces = ref<Trace[]>([]);
 const reflections = ref<Reflection[]>([]);
 const activities = ref<Array<{ id: string; action: keyof typeof ACTION_LABELS; entityType: keyof typeof ENTITY_LABELS; payload: Record<string, unknown>; occurredAt: string }>>([]);
 const loading = ref(true);
+const tracesLoading = ref(false);
 const saving = ref(false);
 const error = ref('');
 const success = ref('');
-const activeTab = ref<'PAGES' | TraceType | 'REFLECTIONS' | 'TIMELINE'>('PAGES');
+const activeTab = ref<DetailTab>('ALL');
+const sortMode = ref<TraceSortMode>('page');
+const tracePage = ref(1);
+const traceTotal = ref(0);
+const filterForm = reactive({ keyword: '', pageNumber: '' });
+const appliedFilters = reactive<{ keyword: string; pageNumber: number | null }>({ keyword: '', pageNumber: null });
 const createType = ref<TraceType | null>(null);
 const editing = ref<Trace | null>(null);
 const showCompleteForm = ref(false);
@@ -54,8 +70,13 @@ const completeForm = reactive({
   text: ''
 });
 
+const totalTraceCount = computed(() => {
+  const summary = book.value?.traceSummary;
+  return (summary?.dogEars ?? 0) + (summary?.annotations ?? 0) + (summary?.rereadMarks ?? 0);
+});
+
 const tabs = computed(() => [
-  { value: 'PAGES' as const, label: '按页' },
+  { value: 'ALL' as const, label: `全部 ${totalTraceCount.value}` },
   { value: 'DOG_EAR' as const, label: `折角 ${book.value?.traceSummary.dogEars ?? 0}` },
   { value: 'ANNOTATION' as const, label: `批注 ${book.value?.traceSummary.annotations ?? 0}` },
   { value: 'REREAD_MARK' as const, label: `重读 ${book.value?.traceSummary.rereadMarks ?? 0}` },
@@ -63,10 +84,8 @@ const tabs = computed(() => [
   { value: 'TIMELINE' as const, label: '本书时间线' }
 ]);
 
-const visibleTraces = computed(() => {
-  const filtered = activeTab.value === 'PAGES' ? traces.value : traces.value.filter((trace) => trace.type === activeTab.value);
-  return [...filtered].sort((a, b) => tracePage(a) - tracePage(b) || b.createdAt.localeCompare(a.createdAt));
-});
+const hasActiveFilter = computed(() => appliedFilters.keyword !== '' || appliedFilters.pageNumber !== null);
+const traceLastPage = computed(() => lastListPage(traceTotal.value, TRACE_PAGE_SIZE));
 
 const statusActions = computed(() => {
   if (!book.value) return [];
@@ -83,10 +102,6 @@ const statusActions = computed(() => {
   return actions;
 });
 
-function tracePage(trace: Trace): number {
-  return trace.type === 'ANNOTATION' ? trace.startPage : trace.pageNumber;
-}
-
 function traceRange(trace: Trace): string {
   if (trace.type === 'ANNOTATION') {
     return trace.startPage === trace.endPage ? `第 ${trace.startPage} 页` : `第 ${trace.startPage}–${trace.endPage} 页`;
@@ -102,34 +117,55 @@ function canEditReflection(reflection: Reflection): boolean {
   return new Date(reflection.editableUntil).getTime() >= Date.now();
 }
 
-async function loadAllTraces(id: string): Promise<Trace[]> {
-  const all: Trace[] = [];
-  let page = 1;
-  let total = 0;
-  do {
-    const params = new URLSearchParams({ page: String(page), pageSize: '100' });
-    const result = await booksApi.traces(id, params);
-    all.push(...result.items);
-    total = result.pagination.total;
-    page += 1;
-  } while (all.length < total && page <= 100);
-  return all;
+async function loadTraces(): Promise<void> {
+  const tab = activeTab.value;
+  if (tab === 'REFLECTIONS' || tab === 'TIMELINE') return;
+  tracesLoading.value = true;
+  try {
+    const fetchPage = (page: number) =>
+      booksApi.traces(
+        bookId.value,
+        buildTraceQuery({
+          tab,
+          filters: { keyword: appliedFilters.keyword, pageNumber: appliedFilters.pageNumber },
+          sort: sortMode.value,
+          page
+        })
+      );
+    let result = await fetchPage(tracePage.value);
+    // 删除当前页最后一条后回退到仍有数据的页码，避免停在空页。
+    const clamped = clampListPage(tracePage.value, result.pagination.total, TRACE_PAGE_SIZE);
+    if (clamped !== tracePage.value) {
+      tracePage.value = clamped;
+      result = await fetchPage(clamped);
+    }
+    traces.value = result.items;
+    traceTotal.value = result.pagination.total;
+  } catch (caught) {
+    error.value = caught instanceof ApiError ? caught.message : '阅读痕迹加载失败';
+  } finally {
+    tracesLoading.value = false;
+  }
+}
+
+/** 写操作之后静默刷新书目计数、感受、时间线与当前过滤后的痕迹视图。 */
+async function refresh(): Promise<void> {
+  const [bookResult, reflectionResult, timelineResult] = await Promise.all([
+    booksApi.get(bookId.value),
+    booksApi.reflections(bookId.value),
+    timelineApi.list(new URLSearchParams({ bookId: bookId.value, pageSize: '100' })),
+    loadTraces()
+  ]);
+  book.value = bookResult.book;
+  reflections.value = reflectionResult.items;
+  activities.value = timelineResult.items;
 }
 
 async function load(): Promise<void> {
   loading.value = true;
   error.value = '';
   try {
-    const [bookResult, loadedTraces, reflectionResult, timelineResult] = await Promise.all([
-      booksApi.get(bookId.value),
-      loadAllTraces(bookId.value),
-      booksApi.reflections(bookId.value),
-      timelineApi.list(new URLSearchParams({ bookId: bookId.value, pageSize: '100' }))
-    ]);
-    book.value = bookResult.book;
-    traces.value = loadedTraces;
-    reflections.value = reflectionResult.items;
-    activities.value = timelineResult.items;
+    await refresh();
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '书目加载失败';
   } finally {
@@ -167,52 +203,114 @@ function openEdit(trace: Trace): void {
   error.value = '';
 }
 
+function setTab(tab: DetailTab): void {
+  if (activeTab.value === tab) return;
+  activeTab.value = tab;
+  tracePage.value = 1;
+  void loadTraces();
+}
+
+function setSort(mode: TraceSortMode): void {
+  if (sortMode.value === mode) return;
+  sortMode.value = mode;
+  tracePage.value = 1;
+  void loadTraces();
+}
+
+function applyFilters(): void {
+  const parsed = filterForm.pageNumber.trim() === '' ? null : parsePageInput(filterForm.pageNumber);
+  if (filterForm.pageNumber.trim() !== '' && parsed === null) {
+    error.value = '请输入有效的页码（大于等于 1 的整数）';
+    return;
+  }
+  error.value = '';
+  appliedFilters.keyword = filterForm.keyword.trim();
+  appliedFilters.pageNumber = parsed;
+  tracePage.value = 1;
+  void loadTraces();
+}
+
+function clearFilters(): void {
+  filterForm.keyword = '';
+  filterForm.pageNumber = '';
+  appliedFilters.keyword = '';
+  appliedFilters.pageNumber = null;
+  error.value = '';
+  tracePage.value = 1;
+  void loadTraces();
+}
+
+function goToTracePage(page: number): void {
+  tracePage.value = page;
+  void loadTraces();
+}
+
+/** 保存或恢复后切换到痕迹所属类型并定位到页码，让变化立刻出现在视图中。 */
+function locateTrace(trace: Trace): void {
+  activeTab.value = trace.type;
+  sortMode.value = 'page';
+  filterForm.keyword = '';
+  appliedFilters.keyword = '';
+  const page = primaryPageOf(trace);
+  filterForm.pageNumber = String(page);
+  appliedFilters.pageNumber = page;
+  tracePage.value = 1;
+}
+
 async function submitTrace(): Promise<void> {
   if (!book.value) return;
   if (!editing.value && !createType.value) return;
   saving.value = true;
   error.value = '';
   try {
+    let savedTrace: Trace | null = null;
     if (createType.value === 'DOG_EAR') {
-      await traceApi.createDogEar(book.value.id, {
+      const result = await traceApi.createDogEar(book.value.id, {
         pageNumber: Number(traceForm.pageNumber),
         reason: traceForm.reason.trim() || null
       });
+      savedTrace = result.dogEar;
     } else if (createType.value === 'ANNOTATION') {
-      await traceApi.createAnnotation(book.value.id, {
+      const result = await traceApi.createAnnotation(book.value.id, {
         startPage: Number(traceForm.startPage),
         endPage: Number(traceForm.endPage || traceForm.startPage),
         content: traceForm.content
       });
+      savedTrace = result.annotation;
     } else if (createType.value === 'REREAD_MARK') {
-      await traceApi.createReread(book.value.id, {
+      const result = await traceApi.createReread(book.value.id, {
         pageNumber: Number(traceForm.pageNumber),
         reason: traceForm.reason.trim() || null
       });
+      savedTrace = result.rereadMark;
     } else if (editing.value?.type === 'DOG_EAR') {
-      await traceApi.updateDogEar(editing.value.id, {
+      const result = await traceApi.updateDogEar(editing.value.id, {
         pageNumber: Number(traceForm.pageNumber),
         reason: traceForm.reason.trim() || null,
         version: editing.value.version
       });
+      savedTrace = result.dogEar;
     } else if (editing.value?.type === 'ANNOTATION') {
-      await traceApi.updateAnnotation(editing.value.id, {
+      const result = await traceApi.updateAnnotation(editing.value.id, {
         startPage: Number(traceForm.startPage),
         endPage: Number(traceForm.endPage || traceForm.startPage),
         content: traceForm.content,
         version: editing.value.version
       });
+      savedTrace = result.annotation;
     } else if (editing.value?.type === 'REREAD_MARK') {
-      await traceApi.updateReread(editing.value.id, {
+      const result = await traceApi.updateReread(editing.value.id, {
         pageNumber: Number(traceForm.pageNumber),
         reason: traceForm.reason.trim() || null,
         version: editing.value.version
       });
+      savedTrace = result.rereadMark;
     }
     createType.value = null;
     editing.value = null;
-    success.value = '阅读痕迹已保存';
-    await load();
+    success.value = '阅读痕迹已保存，已定位到所在页';
+    if (savedTrace) locateTrace(savedTrace);
+    await refresh();
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '保存失败，请检查输入';
   } finally {
@@ -229,7 +327,7 @@ async function deleteTrace(trace: Trace): Promise<void> {
     if (trace.type === 'REREAD_MARK') await traceApi.deleteReread(trace.id, trace.version);
     lastDeleted.value = { kind: trace.type, id: trace.id, label: `${TRACE_LABELS[trace.type]} ${traceRange(trace)}` };
     success.value = '已删除，可在 24 小时内撤销';
-    await load();
+    await refresh();
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '删除失败';
   }
@@ -240,13 +338,24 @@ async function restoreLastDeleted(): Promise<void> {
   error.value = '';
   try {
     const item = lastDeleted.value;
-    if (item.kind === 'DOG_EAR') await traceApi.restoreDogEar(item.id);
-    if (item.kind === 'ANNOTATION') await traceApi.restoreAnnotation(item.id);
-    if (item.kind === 'REREAD_MARK') await traceApi.restoreReread(item.id);
+    let restoredTrace: Trace | null = null;
+    if (item.kind === 'DOG_EAR') {
+      const result = await traceApi.restoreDogEar(item.id);
+      restoredTrace = result.dogEar;
+    }
+    if (item.kind === 'ANNOTATION') {
+      const result = await traceApi.restoreAnnotation(item.id);
+      restoredTrace = result.annotation;
+    }
+    if (item.kind === 'REREAD_MARK') {
+      const result = await traceApi.restoreReread(item.id);
+      restoredTrace = result.rereadMark;
+    }
     if (item.kind === 'REFLECTION') await reflectionApi.restore(item.id);
     lastDeleted.value = null;
     success.value = '删除已撤销';
-    await load();
+    if (restoredTrace) locateTrace(restoredTrace);
+    await refresh();
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '恢复失败';
   }
@@ -290,7 +399,7 @@ async function completeBook(): Promise<void> {
     });
     showCompleteForm.value = false;
     success.value = '这本书的完成感受已保存';
-    await load();
+    await refresh();
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '完成感受保存失败';
   } finally {
@@ -323,7 +432,7 @@ async function saveReflection(): Promise<void> {
     });
     reflectionEdit.value = null;
     success.value = '完成感受已修订，旧版本仍保留在时间线中';
-    await load();
+    await refresh();
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '修订失败';
   } finally {
@@ -337,7 +446,7 @@ async function deleteReflection(reflection: Reflection): Promise<void> {
     await reflectionApi.delete(reflection.id, reflection.version);
     lastDeleted.value = { kind: 'REFLECTION', id: reflection.id, label: `第 ${reflection.completionRound} 次读完感受` };
     success.value = '完成感受已删除，可撤销';
-    await load();
+    await refresh();
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '删除失败';
   }
@@ -485,7 +594,7 @@ onMounted(load);
           type="button"
           role="tab"
           :aria-selected="activeTab === tab.value"
-          @click="activeTab = tab.value"
+          @click="setTab(tab.value)"
         >
           {{ tab.label }}
         </button>
@@ -532,22 +641,103 @@ onMounted(load);
         <p v-if="activities.length === 0" class="empty-inline">这本书还没有变化记录。</p>
       </div>
 
-      <div v-else class="trace-list">
-        <article v-for="trace in visibleTraces" :key="`${trace.type}-${trace.id}`" class="trace-card">
-          <div class="trace-card-heading">
-            <div>
-              <span class="trace-type">{{ TRACE_LABELS[trace.type] }}</span>
-              <strong>{{ traceRange(trace) }}</strong>
-            </div>
-            <div class="button-row">
-              <button class="text-button" type="button" @click="openEdit(trace)">编辑</button>
-              <button class="text-button danger-text" type="button" @click="deleteTrace(trace)">删除</button>
+      <div v-else class="trace-panel">
+        <form class="trace-filter-bar" @submit.prevent="applyFilters">
+          <div class="trace-filter-form">
+            <label class="grow">
+              搜索痕迹摘要
+              <input
+                v-model="filterForm.keyword"
+                type="search"
+                maxlength="100"
+                placeholder="折角原因、批注内容或重读想法"
+              />
+            </label>
+            <label class="page-jump-label">
+              跳到第几页
+              <input
+                v-model="filterForm.pageNumber"
+                type="number"
+                min="1"
+                :max="bookView.pageCount ?? undefined"
+                placeholder="如 42"
+              />
+            </label>
+            <div class="filter-actions">
+              <button class="button" type="submit">过滤定位</button>
+              <button v-if="hasActiveFilter" class="button button-quiet" type="button" @click="clearFilters">清除</button>
             </div>
           </div>
-          <p class="preserve-text">{{ traceBody(trace) }}</p>
-          <p class="muted">创建 {{ formatDateTime(trace.createdAt) }} · 更新 {{ formatDateTime(trace.updatedAt) }}</p>
-        </article>
-        <p v-if="visibleTraces.length === 0" class="empty-inline">这个分类还没有留下痕迹。</p>
+          <div class="trace-filter-meta">
+            <div class="sort-toggle" role="group" aria-label="痕迹排序方式">
+              <button
+                class="sort-option"
+                :class="{ active: sortMode === 'page' }"
+                type="button"
+                :aria-pressed="sortMode === 'page'"
+                @click="setSort('page')"
+              >
+                按页码
+              </button>
+              <button
+                class="sort-option"
+                :class="{ active: sortMode === 'recent' }"
+                type="button"
+                :aria-pressed="sortMode === 'recent'"
+                @click="setSort('recent')"
+              >
+                按时间
+              </button>
+            </div>
+            <p class="muted filter-status" role="status">
+              <span v-if="appliedFilters.pageNumber !== null" class="filter-chip">已定位第 {{ appliedFilters.pageNumber }} 页</span>
+              <span v-if="appliedFilters.keyword" class="filter-chip">含“{{ appliedFilters.keyword }}”</span>
+              <span>共 {{ traceTotal }} 条</span>
+            </p>
+          </div>
+        </form>
+
+        <div v-if="tracesLoading" class="state-panel">正在翻找这几页的痕迹…</div>
+        <template v-else>
+          <div class="trace-list">
+            <article
+              v-for="trace in traces"
+              :key="`${trace.type}-${trace.id}`"
+              class="trace-card"
+              :class="{ located: appliedFilters.pageNumber === primaryPageOf(trace) }"
+            >
+              <div class="trace-card-heading">
+                <div>
+                  <span class="trace-type">{{ TRACE_LABELS[trace.type] }}</span>
+                  <strong>{{ traceRange(trace) }}</strong>
+                </div>
+                <div class="button-row">
+                  <button class="text-button" type="button" @click="openEdit(trace)">编辑</button>
+                  <button class="text-button danger-text" type="button" @click="deleteTrace(trace)">删除</button>
+                </div>
+              </div>
+              <p class="preserve-text">{{ traceBody(trace) }}</p>
+              <p class="muted">创建 {{ formatDateTime(trace.createdAt) }} · 更新 {{ formatDateTime(trace.updatedAt) }}</p>
+            </article>
+            <p v-if="traces.length === 0" class="empty-inline">
+              {{ hasActiveFilter ? '没有符合当前过滤的痕迹，清除定位后再看看。' : '这个分类还没有留下痕迹。' }}
+            </p>
+          </div>
+          <nav v-if="traceTotal > TRACE_PAGE_SIZE" class="pagination" aria-label="痕迹分页">
+            <button class="button button-quiet" type="button" :disabled="tracePage <= 1" @click="goToTracePage(tracePage - 1)">
+              上一页
+            </button>
+            <span>第 {{ tracePage }} / {{ traceLastPage }} 页 · 共 {{ traceTotal }} 条</span>
+            <button
+              class="button button-quiet"
+              type="button"
+              :disabled="tracePage >= traceLastPage"
+              @click="goToTracePage(tracePage + 1)"
+            >
+              下一页
+            </button>
+          </nav>
+        </template>
       </div>
     </section>
   </section>
